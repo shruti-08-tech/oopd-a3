@@ -7,42 +7,43 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
-#include <utility>
 
 namespace {
 
 std::string helpText() {
-    return R"(Pandemic simulator - Parts A+B
+    return R"(Pandemic Simulator - Parts A+B+C
 
 Usage: pandemic_sim [options]
 
-  --grid N                  Grid size (default 1000)
-  --days DAYS               Maximum days (default 200)
-  --seed SEED               Random seed (default 42)
-  --beta X                  Transmission probability
-  --infectious-days D       Infectious duration
-  --mortality X             Mortality probability
-  --initial-infected I0     Initially infected
-  --vaccinated-fraction X   Vaccination fraction
-  --mask-factor X           Mask multiplier
-  --lockdown-factor X       Lockdown multiplier
-  --lockdown-on X           Lockdown activation
-  --lockdown-off X          Lockdown release
+  --grid N                 Grid size
+  --days N                 Maximum days
+  --seed N                 Random seed
+  --beta X                 Transmission probability
+  --infectious-days N      Infectious duration
+  --mortality X            Mortality probability
+  --initial-infected N     Initially infected
+  --vaccinated-fraction X  Vaccinated fraction
 
-  --mode MODE               sequential/spawn/pool
-  --threads T               Pool workers
-  --chunks C                Work partitions
-  --partition TYPE          strips/blocks/interleaved
+  --mask-factor X          Mask multiplier
+  --lockdown-factor X      Lockdown multiplier
+  --lockdown-on X          Lockdown activation
+  --lockdown-off X         Lockdown release
 
-  --snapshot-every K        PPM snapshot interval
-  --snapshot-mode MODE      blocking/off
-  --snapshot-dir DIR        Snapshot directory
-  --max-pending-writes Q    Reserved for Part C
-  --io-latency MS           Simulated I/O delay
+  --mode MODE              sequential/spawn/pool
+  --threads T              Worker threads
+  --chunks C               Work chunks
+  --partition TYPE         strips/blocks/interleaved
 
-  --csv FILE                CSV output path
-  --fixed-days              Disable early termination
-  --help                    Show help
+  --snapshot-every K       Snapshot interval
+  --snapshot-mode MODE     blocking/async/off
+  --snapshot-dir DIR       Image output directory
+  --max-pending-writes Q   Maximum pending writes
+  --io-latency MS          Artificial I/O latency
+
+  --csv FILE               Daily CSV filename
+  --no-csv                 Disable daily CSV output
+  --fixed-days             Disable early termination
+  --help                   Print help
 )";
 }
 
@@ -57,7 +58,7 @@ std::uint64_t parseUInt(
     }
 
     std::size_t used = 0;
-    const auto number = std::stoull(value, &used, 10);
+    auto number = std::stoull(value, &used, 10);
 
     if (used != value.size()) {
         throw std::invalid_argument(
@@ -72,7 +73,7 @@ unsigned parseUnsigned(
     const std::string& value,
     const std::string& option
 ) {
-    const auto number = parseUInt(value, option);
+    auto number = parseUInt(value, option);
 
     if (number > std::numeric_limits<unsigned>::max()) {
         throw std::out_of_range(
@@ -87,7 +88,7 @@ std::size_t parseSize(
     const std::string& value,
     const std::string& option
 ) {
-    const auto number = parseUInt(value, option);
+    auto number = parseUInt(value, option);
 
     if (number > std::numeric_limits<std::size_t>::max()) {
         throw std::out_of_range(
@@ -107,7 +108,7 @@ double parseDouble(
 
     if (used != value.size() || !std::isfinite(number)) {
         throw std::invalid_argument(
-            "Invalid floating point value for " + option
+            "Invalid number for " + option
         );
     }
 
@@ -123,7 +124,6 @@ void checkRange(
 ) {
     if ((lowInclusive ? value < low : value <= low)
         || value > high) {
-
         throw std::invalid_argument(
             std::string(name) + " outside valid range"
         );
@@ -145,6 +145,11 @@ Config parseArgs(int argc, char* argv[]) {
 
         if (option == "--fixed-days") {
             cfg.fixedDays = true;
+            continue;
+        }
+
+        if (option == "--no-csv") {
+            cfg.writeDailyCsv = false;
             continue;
         }
 
@@ -222,17 +227,17 @@ Config parseArgs(int argc, char* argv[]) {
         else if (option == "--csv")
             cfg.csvPath = value;
 
-        else
+        else {
             throw std::invalid_argument(
                 "Unknown option: " + option
             );
+        }
     }
 
     if (cfg.gridSize == 0 ||
         cfg.gridSize >
             std::numeric_limits<std::size_t>::max() /
             cfg.gridSize) {
-
         throw std::invalid_argument(
             "Invalid grid size"
         );
@@ -240,7 +245,6 @@ Config parseArgs(int argc, char* argv[]) {
 
     if (cfg.infectiousDays == 0 ||
         cfg.infectiousDays > 65535) {
-
         throw std::invalid_argument(
             "Invalid infectious duration"
         );
@@ -249,7 +253,6 @@ Config parseArgs(int argc, char* argv[]) {
     if (cfg.threads == 0 ||
         cfg.chunks == 0 ||
         cfg.maxPendingWrites == 0) {
-
         throw std::invalid_argument(
             "Threads, chunks and pending writes must be positive"
         );
@@ -257,22 +260,27 @@ Config parseArgs(int argc, char* argv[]) {
 
     checkRange("--beta", cfg.beta, 0, 1, true);
     checkRange("--mortality", cfg.mortality, 0, 1, true);
+
     checkRange(
         "--vaccinated-fraction",
         cfg.vaccinatedFraction, 0, 1, true
     );
+
     checkRange(
         "--mask-factor",
         cfg.maskFactor, 0, 1, false
     );
+
     checkRange(
         "--lockdown-factor",
         cfg.lockdownFactor, 0, 1, false
     );
+
     checkRange(
         "--lockdown-on",
         cfg.lockdownOn, 0, 1, true
     );
+
     checkRange(
         "--lockdown-off",
         cfg.lockdownOff, 0, 1, true
@@ -280,23 +288,21 @@ Config parseArgs(int argc, char* argv[]) {
 
     if (cfg.lockdownOff > cfg.lockdownOn) {
         throw std::invalid_argument(
-            "Lockdown off threshold exceeds on threshold"
+            "Invalid lockdown thresholds"
         );
     }
 
     if (cfg.mode != "sequential" &&
         cfg.mode != "spawn" &&
         cfg.mode != "pool") {
-
         throw std::invalid_argument(
-            "Mode must be sequential, spawn or pool"
+            "Invalid execution mode"
         );
     }
 
     if (cfg.partition != "strips" &&
         cfg.partition != "blocks" &&
         cfg.partition != "interleaved") {
-
         throw std::invalid_argument(
             "Invalid partition"
         );
@@ -305,23 +311,13 @@ Config parseArgs(int argc, char* argv[]) {
     if (cfg.snapshotMode != "blocking" &&
         cfg.snapshotMode != "async" &&
         cfg.snapshotMode != "off") {
-
         throw std::invalid_argument(
             "Invalid snapshot mode"
         );
     }
 
-    if (cfg.snapshotEvery > 0 &&
-        cfg.snapshotMode == "async") {
-
-        throw std::invalid_argument(
-            "Async snapshots belong to Part C"
-        );
-    }
-
     if (cfg.csvPath.empty() ||
         cfg.snapshotDir.empty()) {
-
         throw std::invalid_argument(
             "Empty output path"
         );
@@ -340,7 +336,7 @@ Config parseArgs(int argc, char* argv[]) {
 
     if (cfg.initiallyInfected > cells - vaccinated) {
         throw std::invalid_argument(
-            "Too many initial infections"
+            "Initial infection count exceeds susceptible population"
         );
     }
 

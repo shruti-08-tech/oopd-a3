@@ -22,13 +22,13 @@ struct Config {
     double lockdownOn = 0.02;
     double lockdownOff = 0.005;
 
-    // Part B
+    // Part B execution modes.
     std::string mode = "sequential";
     unsigned threads = 1;
     unsigned chunks = 1;
     std::string partition = "strips";
 
-    // Snapshot settings, extended in Part C.
+    // Part C snapshot settings.
     unsigned snapshotEvery = 0;
     std::string snapshotMode = "blocking";
     std::string snapshotDir = "snapshots";
@@ -37,6 +37,9 @@ struct Config {
 
     bool fixedDays = false;
     std::string csvPath = "results/sequential.csv";
+
+    // Useful for performance experiments.
+    bool writeDailyCsv = true;
 };
 
 Config parseArgs(int argc, char* argv[]);

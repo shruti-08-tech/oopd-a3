@@ -205,11 +205,11 @@ with tempfile.TemporaryDirectory() as folder:
 
     # Test 14: Async not supported in Part A
     run(
-        "badSnapshotAsync",
-        "--snapshot-every", 1,
-        "--snapshot-mode", "async",
-        success=False,
-    )
+    "badSnapshotMode",
+    "--snapshot-every", 1,
+    "--snapshot-mode", "unknown",
+    success=False,
+)
     checks += 1
 
 print(f"PASS: {checks} Part A checks")
