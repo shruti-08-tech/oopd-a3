@@ -3,6 +3,7 @@
 
 #include "Config.h"
 #include "Model.h"
+#include "Partition.h"
 
 #include <array>
 #include <cstdint>
@@ -11,7 +12,6 @@
 class Simulation {
 public:
     explicit Simulation(Config config);
-
     void run();
 
 private:
@@ -26,9 +26,14 @@ private:
 
     Counts countCurrent() const;
 
-    Counts updateRows(
-        std::size_t beginRow,
-        std::size_t endRow,
+    Counts updateChunk(
+        const Chunk& chunk,
+        unsigned day,
+        const std::array<double, 9>& infectionProb
+    );
+
+    Counts updateSpawn(
+        const std::vector<Chunk>& chunks,
         unsigned day,
         const std::array<double, 9>& infectionProb
     );

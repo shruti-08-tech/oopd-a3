@@ -4,11 +4,11 @@
 #include <cstdint>
 
 enum class State : std::uint8_t {
-    S,  // Susceptible
-    I,  // Infected
-    R,  // Recovered
-    V,  // Vaccinated
-    D   // Dead
+    S,
+    I,
+    R,
+    V,
+    D
 };
 
 struct Cell {
@@ -31,6 +31,15 @@ struct Counts {
             case State::V: ++V; break;
             case State::D: ++D; break;
         }
+    }
+
+    Counts& operator+=(const Counts& other) {
+        S += other.S;
+        I += other.I;
+        R += other.R;
+        V += other.V;
+        D += other.D;
+        return *this;
     }
 
     std::uint64_t total() const {

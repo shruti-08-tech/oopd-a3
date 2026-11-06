@@ -22,11 +22,13 @@ struct Config {
     double lockdownOn = 0.02;
     double lockdownOff = 0.005;
 
-    // Options reserved for Parts B and C.
+    // Part B
+    std::string mode = "sequential";
     unsigned threads = 1;
     unsigned chunks = 1;
     std::string partition = "strips";
 
+    // Snapshot settings, extended in Part C.
     unsigned snapshotEvery = 0;
     std::string snapshotMode = "blocking";
     std::string snapshotDir = "snapshots";

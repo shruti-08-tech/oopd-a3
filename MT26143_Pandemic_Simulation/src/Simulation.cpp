@@ -1,6 +1,7 @@
 
 #include "Simulation.h"
 #include "Random.h"
+#include "ThreadPool.h"
 
 #include <algorithm>
 #include <chrono>
@@ -8,6 +9,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <exception>
+#include <memory>
 #include <iostream>
 #include <numeric>
 #include <random>
@@ -23,7 +26,7 @@ Simulation::Simulation(Config config)
       current_(config_.gridSize * config_.gridSize),
       next_(config_.gridSize * config_.gridSize) {}
 
-// Initialize vaccination and infection.
+// Initialize grid, vaccination and infections.
 void Simulation::initialize() {
     std::mt19937_64 generator(config_.seed);
 
@@ -46,8 +49,6 @@ void Simulation::initialize() {
     const std::size_t selected =
         vaccinated + config_.initiallyInfected;
 
-    // Partial Fisher-Yates shuffle:
-    // select people without replacement.
     for (std::size_t i = 0; i < selected; ++i) {
         std::uniform_int_distribution<std::size_t>
             distribution(i, indices.size() - 1);
@@ -66,7 +67,7 @@ void Simulation::initialize() {
     }
 }
 
-// Count states in current grid.
+// Count all cells in the current grid.
 Counts Simulation::countCurrent() const {
     Counts counts;
 
@@ -77,11 +78,11 @@ Counts Simulation::countCurrent() const {
     return counts;
 }
 
-// Update one row range using only current_
-// and write results only into next_.
-Counts Simulation::updateRows(
-    std::size_t beginRow,
-    std::size_t endRow,
+// Update cells belonging to a given chunk.
+// Workers read only current_ and write only their
+// assigned cells in next_.
+Counts Simulation::updateChunk(
+    const Chunk& chunk,
     unsigned day,
     const std::array<double, 9>& probabilities
 ) {
@@ -89,31 +90,44 @@ Counts Simulation::updateRows(
 
     const std::size_t N = config_.gridSize;
 
-    for (std::size_t r = beginRow; r < endRow; ++r) {
-        for (std::size_t c = 0; c < N; ++c) {
+    for (std::size_t r = chunk.rowBegin;
+         r < chunk.rowEnd;
+         r += chunk.rowStride) {
+
+        for (std::size_t c = chunk.colBegin;
+             c < chunk.colEnd;
+             ++c) {
 
             const std::size_t id = r * N + c;
 
             const Cell& old = current_[id];
             Cell updated = old;
 
-            // Susceptible -> Infected
+            // Susceptible person
             if (old.state == State::S) {
                 unsigned infectedNeighbours = 0;
 
                 const std::size_t lowR =
                     (r == 0) ? 0 : r - 1;
+
                 const std::size_t highR =
                     std::min(r + 1, N - 1);
 
                 const std::size_t lowC =
                     (c == 0) ? 0 : c - 1;
+
                 const std::size_t highC =
                     std::min(c + 1, N - 1);
 
-                // Check eight surrounding cells.
-                for (std::size_t nr = lowR; nr <= highR; ++nr) {
-                    for (std::size_t nc = lowC; nc <= highC; ++nc) {
+                // Check up to eight neighbours.
+                for (std::size_t nr = lowR;
+                     nr <= highR;
+                     ++nr) {
+
+                    for (std::size_t nc = lowC;
+                         nc <= highC;
+                         ++nc) {
+
                         if ((nr != r || nc != c) &&
                             current_[nr * N + nc].state ==
                                 State::I) {
@@ -123,15 +137,19 @@ Counts Simulation::updateRows(
                 }
 
                 if (infectedNeighbours > 0 &&
-                    rand01(config_.seed, day, id, 0) <
-                        probabilities[infectedNeighbours]) {
+                    rand01(
+                        config_.seed,
+                        day,
+                        id,
+                        0
+                    ) < probabilities[infectedNeighbours]) {
 
                     updated.state = State::I;
                     updated.daysInfected = 0;
                 }
             }
 
-            // Infected -> Infected / Recovered / Dead
+            // Infected person
             else if (old.state == State::I) {
                 const unsigned newDays =
                     static_cast<unsigned>(
@@ -139,24 +157,30 @@ Counts Simulation::updateRows(
                     ) + 1;
 
                 if (newDays >= config_.infectiousDays) {
-                    if (rand01(config_.seed, day, id, 1) <
-                        config_.mortality) {
+                    if (rand01(
+                            config_.seed,
+                            day,
+                            id,
+                            1
+                        ) < config_.mortality) {
+
                         updated.state = State::D;
-                    } else {
+                    }
+                    else {
                         updated.state = State::R;
                     }
 
                     updated.daysInfected = 0;
-                } else {
+                }
+                else {
                     updated.daysInfected =
                         static_cast<std::uint16_t>(newDays);
                 }
             }
 
-            // R, V and D remain unchanged.
+            // Recovered, vaccinated, dead: unchanged.
             next_[id] = updated;
 
-            // Local count of next-day states.
             totals.add(updated.state);
         }
     }
@@ -164,7 +188,66 @@ Counts Simulation::updateRows(
     return totals;
 }
 
-// FNV-1a checksum of the complete grid.
+// Thread-per-day version.
+// Create one thread for each chunk and join all.
+Counts Simulation::updateSpawn(
+    const std::vector<Chunk>& chunks,
+    unsigned day,
+    const std::array<double, 9>& probabilities
+) {
+    std::vector<Counts> local(chunks.size());
+
+    std::vector<std::exception_ptr>
+        errors(chunks.size());
+
+    std::vector<std::thread> workers;
+    workers.reserve(chunks.size());
+
+    try {
+        for (std::size_t i = 0; i < chunks.size(); ++i) {
+            workers.emplace_back(
+                [&, i]() {
+                    try {
+                        local[i] = updateChunk(
+                            chunks[i],
+                            day,
+                            probabilities
+                        );
+                    }
+                    catch (...) {
+                        errors[i] =
+                            std::current_exception();
+                    }
+                }
+            );
+        }
+    }
+    catch (...) {
+        for (auto& worker : workers) {
+            if (worker.joinable())
+                worker.join();
+        }
+        throw;
+    }
+
+    // All workers must finish before grid swap.
+    for (auto& worker : workers) {
+        worker.join();
+    }
+
+    Counts totals;
+
+    for (std::size_t i = 0; i < local.size(); ++i) {
+        if (errors[i])
+            std::rethrow_exception(errors[i]);
+
+        totals += local[i];
+    }
+
+    return totals;
+}
+
+// Whole-grid checksum: FNV-1a.
 std::uint64_t Simulation::checksum() const {
     std::uint64_t hash =
         14695981039346656037ULL;
@@ -193,21 +276,22 @@ std::uint64_t Simulation::checksum() const {
     return hash;
 }
 
-// Decide whether lockdown should be active
-// for the following day.
+// Apply lockdown decision for the following day.
 void Simulation::updateLockdown(
     const Counts& totals
 ) {
-    const double infectedFraction =
+    const double fraction =
         static_cast<double>(totals.I) /
         static_cast<double>(totals.total());
 
     if (!lockdownActive_ &&
-        infectedFraction > config_.lockdownOn) {
+        fraction > config_.lockdownOn) {
+
         lockdownActive_ = true;
     }
     else if (lockdownActive_ &&
-             infectedFraction < config_.lockdownOff) {
+             fraction < config_.lockdownOff) {
+
         lockdownActive_ = false;
     }
 }
@@ -220,12 +304,12 @@ double Simulation::effectiveBeta() const {
                 : 1.0);
 }
 
-// Blocking PPM snapshot.
-// Async implementation will come in Part C.
+// Blocking PPM snapshots.
+// Full asynchronous snapshots will be in Part C.
 void Simulation::saveSnapshot(unsigned day) const {
     fs::create_directories(config_.snapshotDir);
 
-    const fs::path path =
+    const auto path =
         fs::path(config_.snapshotDir) /
         ("day_" + std::to_string(day) + ".ppm");
 
@@ -239,15 +323,15 @@ void Simulation::saveSnapshot(unsigned day) const {
 
     std::ofstream out(path, std::ios::binary);
 
-    if (!out)
+    if (!out) {
         throw std::runtime_error(
             "Cannot open snapshot: " + path.string()
         );
+    }
 
     out << "P6\n"
         << config_.gridSize << ' '
-        << config_.gridSize
-        << "\n255\n";
+        << config_.gridSize << "\n255\n";
 
     for (const Cell& cell : current_) {
         const char* rgb;
@@ -274,19 +358,22 @@ void Simulation::saveSnapshot(unsigned day) const {
                 break;
 
             default:
-                throw std::logic_error("Unknown state");
+                throw std::logic_error(
+                    "Unknown state"
+                );
         }
 
         out.write(rgb, 3);
     }
 
-    if (!out)
+    if (!out) {
         throw std::runtime_error(
             "Snapshot write failed: " + path.string()
         );
+    }
 }
 
-// MAIN SEQUENTIAL SIMULATION
+// Main simulation entry point.
 void Simulation::run() {
     initialize();
 
@@ -300,15 +387,15 @@ void Simulation::run() {
 
     std::ofstream csv(csvPath);
 
-    if (!csv)
+    if (!csv) {
         throw std::runtime_error(
-            "Cannot create CSV file"
+            "Cannot create CSV: " + csvPath.string()
         );
+    }
 
     csv << "day,S,I,R,V,D,beta_eff,checksum\n";
     csv << std::setprecision(17);
 
-    // Write one day to CSV.
     auto writeDay = [&](
         unsigned day,
         const Counts& totals,
@@ -329,24 +416,25 @@ void Simulation::run() {
             << std::setfill(' ')
             << '\n';
 
-        if (!csv)
+        if (!csv) {
             throw std::runtime_error(
                 "CSV write failed"
             );
+        }
     };
 
-    // Optional blocking snapshots.
     auto snapshotIfScheduled = [&](unsigned day) {
         if (config_.snapshotEvery > 0 &&
             config_.snapshotMode == "blocking" &&
             day % config_.snapshotEvery == 0) {
+
             saveSnapshot(day);
         }
     };
 
     Counts totals = countCurrent();
 
-    // Day 0: initial state.
+    // Record initial conditions.
     writeDay(
         0,
         totals,
@@ -354,8 +442,35 @@ void Simulation::run() {
     );
 
     snapshotIfScheduled(0);
-
     updateLockdown(totals);
+
+    // Create chunks only for parallel modes.
+    std::vector<Chunk> chunks;
+
+    if (config_.mode != "sequential") {
+        chunks = makeChunks(
+            config_.gridSize,
+            config_.chunks,
+            config_.partition
+        );
+    }
+
+    // Persistent pool for all simulation days.
+    std::unique_ptr<ThreadPool> pool;
+
+    if (config_.mode == "pool") {
+        pool = std::make_unique<ThreadPool>(
+            config_.threads,
+
+            [this](
+                const Chunk& chunk,
+                unsigned day,
+                const std::array<double, 9>& p
+            ) {
+                return updateChunk(chunk, day, p);
+            }
+        );
+    }
 
     unsigned completedDays = 0;
 
@@ -363,14 +478,12 @@ void Simulation::run() {
          day <= config_.maxDays;
          ++day) {
 
-        // Stop if no infected people remain.
-        if (!config_.fixedDays && totals.I == 0)
+        if (!config_.fixedDays && totals.I == 0) {
             break;
+        }
 
         const double beta = effectiveBeta();
 
-        // Precompute infection probabilities.
-        // P(k) = 1 - (1 - beta)^k.
         std::array<double, 9> probabilities{};
 
         double survival = 1.0;
@@ -383,23 +496,45 @@ void Simulation::run() {
             probabilities[k] = 1.0 - survival;
         }
 
-        // Sequentially update all rows.
-        totals = updateRows(
-            0,
-            config_.gridSize,
-            day,
-            probabilities
-        );
+        // Select execution mode.
+        if (config_.mode == "sequential") {
 
-        // Finish one day before swapping.
+            totals = updateChunk(
+                {
+                    0,
+                    config_.gridSize,
+                    0,
+                    config_.gridSize,
+                    1
+                },
+                day,
+                probabilities
+            );
+        }
+        else if (config_.mode == "spawn") {
+
+            totals = updateSpawn(
+                chunks,
+                day,
+                probabilities
+            );
+        }
+        else {
+
+            totals = pool->execute(
+                chunks,
+                day,
+                probabilities
+            );
+        }
+
+        // Workers are finished: safe to swap.
         current_.swap(next_);
 
-        // Save the resulting population.
         writeDay(day, totals, beta);
-
         snapshotIfScheduled(day);
 
-        // Decisions affect the next day.
+        // Changes transmission for the next day.
         updateLockdown(totals);
 
         completedDays = day;
@@ -407,13 +542,14 @@ void Simulation::run() {
 
     csv.close();
 
-    if (!csv)
+    if (!csv) {
         throw std::runtime_error(
             "CSV close failed"
         );
+    }
 
     std::cout
-        << "Completed " << completedDays << " days\n"
+        << "Completed " << completedDays << " days; "
         << "S=" << totals.S
         << " I=" << totals.I
         << " R=" << totals.R
